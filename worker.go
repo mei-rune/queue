@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/RichardKnop/machinery/v1/log"
 	"github.com/opentracing/opentracing-go"
 	"github.com/runner-mei/log"
 )

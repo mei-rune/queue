@@ -31,15 +31,19 @@ type WorkerConfig struct{}
 
 type Broker interface {
 	// @http.GET(path="/settings/:workerID")
-	GetConfig(ctx context.Context, workerID string) (*WorkerConfig, error)
+	GetConfig(ctx context.Context, workerID WorkerID) (*WorkerConfig, error)
 	// @http.PUT(path="/settings/:workerID", data="cfg")
-	SetConfig(ctx context.Context, workerID string, cfg *WorkerConfig) error
+	SetConfig(ctx context.Context, workerID WorkerID, cfg *WorkerConfig) error
 
 	// @http.POST(path="", data="task")
-	Send(ctx context.Context, task *Task) (AsyncTaskResult, error)
+	Send(ctx context.Context, task *Task) (TaskID, error)
 
 	// @http.POST(path="/report", data="event")
 	Report(ctx context.Context, event *ReportEvent) error
 	// @http.GET(path="")
-	Fetch(ctx context.Context, workerID string) (*Task, error)
+	Fetch(ctx context.Context, workerID WorkerID, consumerTag string) (*Task, error)
+}
+
+type Client interface {
+	Send(ctx context.Context, task *Task) (AsyncTaskResult, error)
 }

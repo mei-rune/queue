@@ -2,45 +2,86 @@ package queue
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
+	"github.com/runner-mei/errors"
 	"github.com/three-plus-three/modules/as"
 	"github.com/three-plus-three/modules/util"
 )
 
-type result struct {
+type asyncResult struct {
+	taskID TaskID
+	srv    *Server
+	c      chan *asyncResult
+
 	value interface{}
 	err   error
 }
 
-type asyncResult struct {
-	task *Task
-	srv  *Server
-	c    chan *result
-}
-
 func (result *asyncResult) ID() TaskID {
-	return result.task.ID
+	return result.taskID
 }
 func (result *asyncResult) State() (TaskStatus, error) {
-	return result.srv.backend.GetState()
+	state, err := result.srv.backend.GetState(context.Background(), result.taskID)
+	if err != nil {
+		return TaskStatusInit, err
+	}
+	return state.State, nil
 }
-
-func (result *asyncResult) Cancel() (bool, error) {
-	return false, errors.New("notimplemented")
+func (result *asyncResult) Cancel() error {
+	err := result.srv.cancel(result.taskID)
+	result.reply(nil, context.Canceled)
+	return err
 }
 func (result *asyncResult) Get(ctx context.Context, value interface{}) error {
-	r := <-result.c
-	if r.err != nil {
-		return r.err
-	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-	return assignValue(value, r.value)
+	for {
+		select {
+		case <-ticker.C:
+			state, err := result.srv.backend.GetState(ctx, result.taskID)
+			if err != nil {
+				return err
+			}
+			if state.IsCompleted() {
+				if state.State == TaskStatusFailure {
+					if state.Error == nil {
+						state.Error = errors.New("错误!!!")
+					}
+					return state.Error
+				}
+
+				return assignValue(value, state.Result)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case r := <-result.c:
+			if r.err != nil {
+				return r.err
+			}
+
+			return assignValue(value, r.value)
+		}
+	}
+}
+func (result *asyncResult) reply(value interface{}, err error) bool {
+	result.value = value
+	result.err = err
+	select {
+	case result.c <- result:
+		return true
+	default:
+		return false
+	}
 }
 
 func assignValue(recv, from interface{}) (err error) {
+	if from == nil {
+		return nil
+	}
 	switch value := recv.(type) {
 	case *string:
 		*value, err = as.String(from)

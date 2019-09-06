@@ -1,14 +1,13 @@
-
-
-
-
+package queue
 
 import (
+	"container/list"
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/runner-mei/log"
-	"github.com/three-plus-three/modules/as"
 )
 
 type BackgroundTask struct {
@@ -35,51 +34,83 @@ type TaskSummary struct {
 
 // Backend - a common interface for all result backends
 type Backend interface {
-	// Setting / getting task state
-	Create(task *Task) (TaskID, error)
-	SetStateAccepted(id TaskID) error
-	SetStateSuccess(id TaskID, result interface{}) error
-	SetStateFailure(id TaskID, failureMessage string) error
-	GetState(id TaskID) (TaskStatus, error)
-	GetResult(id TaskID) (interface{}, error)
+	Create(ctx context.Context, task *Task) (TaskID, error)
+	Delete(ctx context.Context, id TaskID)
+	Fetch(ctx context.Context, workerID WorkerID, consumerTag string) (*Task, error)
+	SetStateAccepted(ctx context.Context, id TaskID) error
+	SetStateSuccess(ctx context.Context, id TaskID, result interface{}) error
+	SetStateFailure(ctx context.Context, id TaskID, failureMessage string) error
+	GetState(ctx context.Context, id TaskID) (*TaskState, error)
+	GetResult(ctx context.Context, id TaskID) (interface{}, error)
 
 	GetSummaries(queue string) ([]TaskSummary, error)
 }
 
-type Queue interface {
-	Push(ctx context.Context, task *Task) error
-	Pop(ctx context.Context, consumerTag string) (*Task, error)
+type Pubsub interface {
+	Pub(ctx context.Context, taskID TaskID) error
+	Sub(ctx context.Context, cb func(taskID TaskID)) error
+}
+
+type Settings interface {
+	GetConfig(ctx context.Context, workerID WorkerID) (*WorkerConfig, error)
+	SetConfig(ctx context.Context, workerID WorkerID, cfg *WorkerConfig) error
 }
 
 type Server struct {
 	logger   log.Logger
-	settings ds_client.SettingsImpl
+	settings Settings
 
-	queue   Queue
+	taskQueue   Pubsub
+	resultQueue Pubsub
+
 	backend Backend
+	waits   sync.Map
+
+	workersLock sync.Mutex
+	workers     list.List
 }
 
-func (srv *Server) GetConfig(ctx context.Context, workerID string) (*WorkerConfig, error) {
-	var cfg WorkerConfig
-	err := ds_client.ReadSettings(ctx, srv.settings, "taskqueue.", &cfg)
-	return &cfg, err
+func (srv *Server) GetConfig(ctx context.Context, workerID WorkerID) (*WorkerConfig, error) {
+	return srv.settings.GetConfig(ctx, workerID)
+	// var cfg WorkerConfig
+	// err := ds_client.ReadSettings(ctx, srv.settings, "taskqueue.", &cfg)
+	// return &cfg, err
 }
 
-func (srv *Server) SetConfig(ctx context.Context, workerID string, cfg *WorkerConfig) error {
-	return ds_client.SaveSettings(ctx, srv.settings, "taskqueue.", cfg)
+func (srv *Server) SetConfig(ctx context.Context, workerID WorkerID, cfg *WorkerConfig) error {
+	return srv.settings.SetConfig(ctx, workerID, cfg)
+	// return ds_client.SaveSettings(ctx, srv.settings, "taskqueue.", cfg)
 }
 
-func (srv *Server) Send(ctx context.Context, task *Task) (AsyncTaskResult, error) {
+func (srv *Server) Send(ctx context.Context, task *Task) (TaskID, error) {
 	id, err := srv.backend.Create(ctx, task)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	task.ID = id
-	if err := srv.queue.Push(task); err != nil {
-		return nil, err
+	if err := srv.taskQueue.Pub(ctx, id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (srv *Server) SendAsync(ctx context.Context, task *Task) (AsyncTaskResult, error) {
+	id, err := srv.Send(ctx, task)
+	if err != nil {
+		return 0, err
 	}
 
-	return &asyncResult{task: task, srv: srv}, nil
+	result := &asyncResult{taskID: id, srv: srv, c: make(chan *asyncResult, 1)}
+	srv.waits.Store(id, result)
+	return result, nil
+}
+
+func (srv *Server) cancel(id TaskID) error {
+	err := srv.backend.Delete(nil, id)
+	if err != nil {
+		return err
+	}
+	srv.waits.Delete(id)
+	return nil
 }
 
 func (srv *Server) Report(ctx context.Context, event *ReportEvent) error {
@@ -89,7 +120,7 @@ func (srv *Server) Report(ctx context.Context, event *ReportEvent) error {
 	case ReportSucceeded:
 		return srv.backend.SetStateSuccess(event.TaskID, event.Data)
 	case ReportFailure:
-		return srv.backend.SetStateFailure(event.TaskID, as.StringWithDefault(event.Data, ""))
+		return srv.backend.SetStateFailure(event.TaskID, fmt.Sprint(event.Data))
 	case ReportHeartbeat:
 	case ReportLogRecord:
 	default:
@@ -97,8 +128,65 @@ func (srv *Server) Report(ctx context.Context, event *ReportEvent) error {
 	}
 }
 
-func (srv *Server) Fetch(ctx context.Context, consumerTag string) (*Task, error) {
-	return srv.queue.Pop(ctx, consumerTag)
+type subClient struct {
+	element     *list.Element
+	workerID    WorkerID
+	consumerTag string
+	c           chan TaskID
 }
 
+func (srv *Server) OnTask(taskID TaskID) {
+	srv.workersLock.Lock()
+	defer srv.workersLock.Unlock()
 
+	for it := srv.workers.Front(); it != nil; it = it.Next() {
+		sc := it.Value.(*subClient)
+		sc.c <- taskID
+	}
+}
+
+func (srv *Server) OnResult(taskID TaskID) {
+
+	o := srv.waits.Load(taskID)
+	if o == nil {
+		return
+	}
+
+}
+
+func (srv *Server) Fetch(ctx context.Context, workerID WorkerID, consumerTag string) (*Task, error) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	rc := &subClient{
+		workerID:    workerID,
+		consumerTag: consumerTag,
+		c:           make(chan TaskID, 1),
+	}
+
+	srv.workersLock.Lock()
+	rc.element = srv.workers.InsertAfter(rc)
+	srv.workersLock.Unlock()
+
+	defer func() {
+		srv.workersLock.Lock()
+		srv.workers.Remove(rc.element)
+		rc.element = nil
+		srv.workersLock.Unlock()
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-rc.c:
+		fallthrough
+	case <-ticker.C:
+		task, err := srv.backend.Fetch(ctx, rc.workerID, rc.consumerTag)
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil
+		}
+	}
+}

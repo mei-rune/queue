@@ -3,13 +3,13 @@ package queue
 import (
 	"container/list"
 	"context"
-	"errors"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/opentracing/opentracing-go"
-	opentracing "github.com/opentracing/opentracing-go"
 	opentracing_ext "github.com/opentracing/opentracing-go/ext"
+	"github.com/runner-mei/errors"
 	"github.com/runner-mei/log"
 )
 
@@ -20,11 +20,14 @@ var (
 
 type Headers struct {
 	TraceContext opentracing.TextMapCarrier `json:"trace_context"`
+	WorkerID     WorkerID                   `json:"worker_id"`
 	RoutingKey   string                     `json:"routing_key"`
 	Immutable    bool                       `json:"immutable"`
 	RetryCount   int                        `json:"retry_count"`
 	RetryTimeout int                        `json:"retry_timeout"`
 }
+
+type WorkerID string
 
 type TaskID int64
 
@@ -57,8 +60,21 @@ type TaskStatus int32
 const (
 	TaskStatusInit TaskStatus = iota
 	TaskStatusRunning
-	TaskStatusEnd
+	TaskStatusFailure
+	TaskStatusSucceeded
 )
+
+// TaskState represents a state of a task
+type TaskState struct {
+	State   TaskStatus    `json:"state"`
+	Result  interface{}   `json:"result"`
+	Error   *errors.Error `json:"error"`
+	EndedAt time.Time     `json:"ended_at"`
+}
+
+func (state *TaskState) IsCompleted() bool {
+	return state.State == TaskStatusFailure || state.State == TaskStatusSucceeded
+}
 
 type Runnable interface {
 	Run(ctx context.Context) (interface{}, error)
